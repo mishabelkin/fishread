@@ -34,6 +34,7 @@
     <string name="message_document_converted_on_device">Document converted on-device.</string>
     <string name="message_local_pdf_converted_on_device">Local PDF converted on-device.</string>
     <string name="message_captured_text_opened">Captured text opened on-device.</string>
+    <string name="message_opened_browser_snapshot_fallback">Used the visible browser text because the page could not be fetched.</string>
     <string name="message_cache_cleared">Cleared %1$d cached document(s), freeing %2$s.</string>
     <string name="message_cache_already_empty">Cache is already empty.</string>
     <string name="message_voice_selected">Voice updated.</string>

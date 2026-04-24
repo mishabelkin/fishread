@@ -8,6 +8,8 @@ import android.graphics.Rect
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.Toast
@@ -38,6 +40,144 @@ internal fun looksLikeBrowserOpenableUrl(url: String): Boolean {
     }
     val lower = normalized.lowercase(Locale.US)
     return lower.startsWith("http://") || lower.startsWith("https://")
+}
+
+internal fun looksLikeBrowserPackage(packageName: String): Boolean {
+    val lower = packageName.trim().lowercase(Locale.US)
+    if (lower.isBlank()) {
+        return false
+    }
+
+    return lower.contains("chrome") ||
+        lower.contains("firefox") ||
+        lower.contains("brave") ||
+        lower.contains("browser") ||
+        lower.contains("opera") ||
+        lower.contains("duckduckgo") ||
+        lower.contains("emmx") ||
+        lower.contains("edge")
+}
+
+internal data class TrackedBrowserUrl(
+    val packageName: String,
+    val url: String,
+    val capturedAtMs: Long,
+    val pageSignature: String
+)
+
+internal data class AccessibilityNodeTextCandidate(
+    val text: String,
+    val fromContentDescription: Boolean
+)
+
+internal fun resolveRecentTrackedBrowserUrl(
+    activePackageName: String,
+    trackedBrowserUrl: TrackedBrowserUrl?,
+    nowMs: Long,
+    maxAgeMs: Long,
+    currentPageSignature: String?
+): String? {
+    val normalizedActivePackage = activePackageName.trim().lowercase(Locale.US)
+    if (!looksLikeBrowserPackage(normalizedActivePackage)) {
+        return null
+    }
+
+    val tracked = trackedBrowserUrl ?: return null
+    if (tracked.packageName != normalizedActivePackage) {
+        return null
+    }
+    if (!looksLikeBrowserOpenableUrl(tracked.url)) {
+        return null
+    }
+    if (nowMs - tracked.capturedAtMs > maxAgeMs) {
+        return null
+    }
+    val normalizedCurrentSignature = currentPageSignature
+        ?.trim()
+        ?.takeIf { it.isNotBlank() }
+        ?: return null
+    if (tracked.pageSignature != normalizedCurrentSignature) {
+        return null
+    }
+
+    return tracked.url
+}
+
+private val BROWSER_RENDERED_CAPTURE_HOST_SUFFIXES = listOf(
+    "wsj.com",
+    "nytimes.com"
+)
+
+internal fun shouldPreferBrowserRenderedCaptureForUrl(url: String): Boolean {
+    if (!looksLikeBrowserOpenableUrl(url) || looksLikePdfSessionDocumentId(url)) {
+        return false
+    }
+
+    val host = runCatching {
+        java.net.URI(url).host.orEmpty().lowercase(Locale.US)
+    }.getOrDefault("")
+    if (host.isBlank()) {
+        return false
+    }
+
+    return BROWSER_RENDERED_CAPTURE_HOST_SUFFIXES.any { suffix ->
+        host == suffix || host.endsWith(".$suffix")
+    }
+}
+
+internal fun shouldPreferCapturedBrowserPage(
+    activePackageName: String,
+    currentUrl: String,
+    combinedBlockCount: Int,
+    combinedChars: Int
+): Boolean {
+    if (!looksLikeBrowserPackage(activePackageName)) {
+        return false
+    }
+    if (!shouldPreferBrowserRenderedCaptureForUrl(currentUrl)) {
+        return false
+    }
+
+    return combinedBlockCount >= 2 && combinedChars >= 240
+}
+
+internal fun shouldAttemptAccessibilityAutoScroll(
+    activePackageName: String,
+    hasScrollTarget: Boolean,
+    combinedBlockCount: Int,
+    combinedChars: Int,
+    alreadyExposedEnough: Boolean
+): Boolean {
+    if (!hasScrollTarget) {
+        return false
+    }
+
+    val packageName = activePackageName.trim().lowercase(Locale.US)
+    if (packageName.contains("launcher") || packageName.contains("systemui")) {
+        return false
+    }
+
+    if (!alreadyExposedEnough) {
+        return true
+    }
+
+    return looksLikeBrowserPackage(packageName) &&
+        (combinedBlockCount < 12 || combinedChars < 6_000)
+}
+
+internal fun shouldUseExposedAccessibilityBlocks(
+    activePackageName: String,
+    sourceLabel: String?
+): Boolean {
+    val normalizedSource = sourceLabel?.trim().orEmpty()
+    if (!looksLikeBrowserPackage(activePackageName)) {
+        return true
+    }
+    if (!shouldPreferBrowserRenderedCaptureForUrl(normalizedSource)) {
+        return true
+    }
+
+    return false
 }
 
 internal fun shouldReopenReaderForCurrentPdfUrl(
@@ -161,26 +301,106 @@ internal fun chooseBestAccessibilityPdfUrlCandidate(candidates: List<Accessibili
         ?.takeIf(::looksLikePdfSessionDocumentId)
 }
 
+internal fun resolveAccessibilityNodeTextCandidate(
+    rawText: String?,
+    rawContentDescription: String?
+): AccessibilityNodeTextCandidate? {
+    val normalizedText = normalizeAccessibilityNodeText(rawText)
+    if (normalizedText.isNotBlank()) {
+        return AccessibilityNodeTextCandidate(
+            text = normalizedText,
+            fromContentDescription = false
+        )
+    }
+
+    val normalizedContentDescription = normalizeAccessibilityNodeText(rawContentDescription)
+    if (!shouldUseAccessibilityContentDescriptionFallback(normalizedContentDescription)) {
+        return null
+    }
+
+    return AccessibilityNodeTextCandidate(
+        text = normalizedContentDescription,
+        fromContentDescription = true
+    )
+}
+
+private fun normalizeAccessibilityNodeText(raw: String?): String {
+    return raw
+        ?.replace(Regex("\\s+"), " ")
+        ?.trim()
+        .orEmpty()
+}
+
+internal fun shouldUseAccessibilityContentDescriptionFallback(text: String): Boolean {
+    if (text.isBlank()) {
+        return false
+    }
+
+    val normalized = text.replace(Regex("\\s+"), " ").trim()
+    val lower = normalized.lowercase(Locale.US)
+    if (lower.startsWith("http://") || lower.startsWith("https://") || lower.startsWith("www.")) {
+        return false
+    }
+    if (lower.contains("%2f") || lower.contains("%3a")) {
+        return false
+    }
+
+    val punctuationCount = normalized.count { !it.isLetterOrDigit() && !it.isWhitespace() }
+    return punctuationCount <= maxOf(4, normalized.length / 3)
+}
+
+internal fun normalizeBrowserPageSignature(text: String?): String? {
+    val normalized = text
+        ?.replace(Regex("\\s+"), " ")
+        ?.trim()
+        .orEmpty()
+    if (normalized.length !in 4..220) {
+        return null
+    }
+
+    val lower = normalized.lowercase(Locale.US)
+    if (
+        lower.startsWith("http://") ||
+        lower.startsWith("https://") ||
+        lower.startsWith("www.") ||
+        lower in setOf("subscribe", "sign in", "search", "menu", "home", "back")
+    ) {
+        return null
+    }
+
+    return normalizeAccessibilityToken(normalized)
+        .replace(Regex("\\s+"), " ")
+        .takeIf { it.length >= 4 }
+}
+
 private fun sanitizeAccessibilityUrl(url: String): String {
     return url.trim().trimEnd('.', ',', ';', ':', '!', '?', ')', ']', '}')
 }
 
 class ReadAccessibilityService : AccessibilityService() {
     companion object {
+        private const val LOG_TAG = "ReadAccessibility"
         private const val MAX_AUTO_SCROLL_STEPS = 10
         private const val MAX_STALLED_SCROLL_STEPS = 2
         private const val SCROLL_SETTLE_DELAY_MS = 650L
         private const val NEXT_SCROLL_DELAY_MS = 180L
+        private const val BROWSER_URL_TRACK_MAX_AGE_MS = 60_000L
+        private const val BROWSER_URL_TRACK_THROTTLE_MS = 1_000L
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var accessibilityButtonCallback: AccessibilityButtonController.AccessibilityButtonCallback? = null
     private var activeCaptureSession: AccessibilityCaptureSession? = null
+    private var lastTrackedBrowserUrl: TrackedBrowserUrl? = null
+    private var lastBrowserUrlTrackAttemptAtMs: Long = 0L
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         serviceInfo = serviceInfo?.apply {
-            eventTypes = 0
+            eventTypes =
+                AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
+                    AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
+                    AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED
             notificationTimeout = 0
             flags = AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
                 AccessibilityServiceInfo.FLAG_REQUEST_ACCESSIBILITY_BUTTON
@@ -188,7 +408,9 @@ class ReadAccessibilityService : AccessibilityService() {
         registerAccessibilityButtonCallbackIfSupported()
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) = Unit
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        maybeTrackBrowserUrl(event)
+    }
 
     override fun onInterrupt() = Unit
 
@@ -215,7 +437,6 @@ class ReadAccessibilityService : AccessibilityService() {
         }
 
         val playbackState = ReaderPlaybackStore.uiState.value
-
         if (root == null) {
             if (shouldResumeExistingReaderSession(playbackState)) {
                 startActivity(ReaderAccessibilityIntents.createOpenReaderIntent(this))
@@ -225,13 +446,93 @@ class ReadAccessibilityService : AccessibilityService() {
             return
         }
 
-        findBrowserCurrentUrl(root)?.let { currentUrl ->
-            if (shouldReopenReaderForCurrentUrl(playbackState, currentUrl)) {
-                startActivity(ReaderAccessibilityIntents.createOpenReaderIntent(this))
-            } else {
-                startActivity(ReaderAccessibilityIntents.createOpenUrlIntent(this, currentUrl))
-            }
+        val activePackageName = root.packageName?.toString().orEmpty()
+        val activePageSignature = findBrowserPageSignature(root)
+        val currentUrl = findBrowserCurrentUrl(root)?.also { resolvedUrl ->
+            rememberTrackedBrowserUrl(activePackageName, resolvedUrl, activePageSignature)
+        } ?: resolveRecentTrackedBrowserUrl(
+            activePackageName = activePackageName,
+            trackedBrowserUrl = lastTrackedBrowserUrl,
+            nowMs = SystemClock.elapsedRealtime(),
+            maxAgeMs = BROWSER_URL_TRACK_MAX_AGE_MS,
+            currentPageSignature = activePageSignature
+        )
+
+        if (currentUrl != null && shouldReopenReaderForCurrentUrl(playbackState, currentUrl)) {
+            startActivity(ReaderAccessibilityIntents.createOpenReaderIntent(this))
             showToast(getString(R.string.accessibility_capture_opened))
+            return
+        }
+
+        if (currentUrl != null) {
+            val session = AccessibilityCaptureSession(sourceLabel = currentUrl)
+            val windowSummary = collectCurrentWindowBlocks(session, root)
+            val initialScrollTarget = findBestScrollableNode(root)
+            val shouldCaptureRenderedBrowserText = shouldPreferCapturedBrowserPage(
+                activePackageName = activePackageName,
+                currentUrl = currentUrl,
+                combinedBlockCount = windowSummary.combinedBlockCount,
+                combinedChars = windowSummary.combinedChars
+            )
+
+            if (!shouldCaptureRenderedBrowserText) {
+                val browserFallbackCapture = buildImmediateBrowserFallbackCapture(
+                    root = root,
+                    currentUrl = currentUrl,
+                    sessionBlocks = session.blocks
+                )
+                Log.i(
+                    LOG_TAG,
+                    "Opening browser URL with fallback backup for $currentUrl; backupChars=${browserFallbackCapture?.text?.length ?: 0}"
+                )
+                initialScrollTarget?.recycle()
+                startActivity(
+                    ReaderAccessibilityIntents.createOpenUrlIntent(
+                        context = this,
+                        url = currentUrl,
+                        fallbackCapture = browserFallbackCapture
+                    )
+                )
+                showToast(getString(R.string.accessibility_capture_opened))
+                return
+            }
+
+            if (windowSummary.newBlockCount == 0 && initialScrollTarget == null) {
+                val browserFallbackCapture = buildImmediateBrowserFallbackCapture(
+                    root = root,
+                    currentUrl = currentUrl,
+                    sessionBlocks = session.blocks
+                )
+                Log.i(
+                    LOG_TAG,
+                    "Opening browser URL without scroll target for $currentUrl; backupChars=${browserFallbackCapture?.text?.length ?: 0}"
+                )
+                startActivity(
+                    ReaderAccessibilityIntents.createOpenUrlIntent(
+                        context = this,
+                        url = currentUrl,
+                        fallbackCapture = browserFallbackCapture
+                    )
+                )
+                showToast(getString(R.string.accessibility_capture_opened))
+                return
+            }
+
+            val shouldAutoScroll = shouldAttemptAccessibilityAutoScroll(
+                activePackageName = activePackageName,
+                hasScrollTarget = initialScrollTarget != null,
+                combinedBlockCount = windowSummary.combinedBlockCount,
+                combinedChars = windowSummary.combinedChars,
+                alreadyExposedEnough = windowSummary.alreadyExposedEnough
+            )
+            initialScrollTarget?.recycle()
+            if (shouldAutoScroll) {
+                activeCaptureSession = session
+                showToast(getString(R.string.accessibility_capture_collecting))
+                scheduleNextAutoScrollStep()
+            } else {
+                finishCapture(session)
+            }
             return
         }
 
@@ -248,10 +549,15 @@ class ReadAccessibilityService : AccessibilityService() {
             return
         }
 
+        val shouldAutoScroll = shouldAttemptAccessibilityAutoScroll(
+            activePackageName = activePackageName,
+            hasScrollTarget = initialScrollTarget != null,
+            combinedBlockCount = windowSummary.combinedBlockCount,
+            combinedChars = windowSummary.combinedChars,
+            alreadyExposedEnough = windowSummary.alreadyExposedEnough
+        )
         initialScrollTarget?.recycle()
-        if (windowSummary.alreadyExposedEnough) {
-            finishCapture(session)
-        } else if (shouldAttemptAutoScroll(root, initialScrollTarget != null)) {
+        if (shouldAutoScroll) {
             activeCaptureSession = session
             showToast(getString(R.string.accessibility_capture_collecting))
             scheduleNextAutoScrollStep()
@@ -273,17 +579,23 @@ class ReadAccessibilityService : AccessibilityService() {
         session: AccessibilityCaptureSession,
         root: AccessibilityNodeInfo
     ): WindowCaptureSummary {
+        val activePackageName = root.packageName?.toString().orEmpty()
         val contentRoot = findBestScrollableNode(root)
         val visibleBlocks = (contentRoot ?: root).let { contentNode ->
             extractCapturedBlocks(contentNode, visibleOnly = true)
         }
-        val exposedBlocks = contentRoot?.let { scrollTarget ->
-            try {
-                extractCapturedBlocks(scrollTarget, visibleOnly = false)
-            } finally {
-                scrollTarget.recycle()
-            }
-        }.orEmpty()
+        val exposedBlocks = if (shouldUseExposedAccessibilityBlocks(activePackageName, session.sourceLabel)) {
+            contentRoot?.let { scrollTarget ->
+                try {
+                    extractCapturedBlocks(scrollTarget, visibleOnly = false)
+                } finally {
+                    scrollTarget.recycle()
+                }
+            }.orEmpty()
+        } else {
+            contentRoot?.recycle()
+            emptyList()
+        }
 
         var addedCount = 0
         val combinedBlocks = buildList {
@@ -294,6 +606,7 @@ class ReadAccessibilityService : AccessibilityService() {
                 }
             }
         }
+        val combinedChars = combinedBlocks.sumOf { it.length }
 
         combinedBlocks.forEach { block ->
             val token = normalizeAccessibilityToken(block)
@@ -304,6 +617,8 @@ class ReadAccessibilityService : AccessibilityService() {
         }
         return WindowCaptureSummary(
             newBlockCount = addedCount,
+            combinedBlockCount = combinedBlocks.size,
+            combinedChars = combinedChars,
             alreadyExposedEnough = isLikelyAlreadyFullyExposed(visibleBlocks, exposedBlocks)
         )
     }
@@ -371,6 +686,23 @@ class ReadAccessibilityService : AccessibilityService() {
         activeCaptureSession = null
         val capturedText = session.blocks.joinToString("\n\n").trim()
         if (capturedText.length < 120) {
+            session.sourceLabel
+                ?.takeIf(::looksLikeBrowserOpenableUrl)
+                ?.let { fallbackUrl ->
+                    val fallbackCapture = buildBrowserFallbackCaptureFromBlocks(
+                        currentUrl = fallbackUrl,
+                        blocks = session.blocks
+                    )
+                    startActivity(
+                        ReaderAccessibilityIntents.createOpenUrlIntent(
+                            context = this,
+                            url = fallbackUrl,
+                            fallbackCapture = fallbackCapture
+                        )
+                    )
+                    showToast(getString(R.string.accessibility_capture_opened))
+                    return
+                }
             showToast(getString(R.string.accessibility_capture_no_text))
             return
         }
@@ -380,19 +712,62 @@ class ReadAccessibilityService : AccessibilityService() {
             ReaderAccessibilityIntents.createOpenCapturedTextIntent(
                 context = this,
                 text = capturedText,
-                title = title
+                title = title,
+                sourceLabel = session.sourceLabel
             )
         )
         showToast(getString(R.string.accessibility_capture_opened))
     }
 
-    private fun shouldAttemptAutoScroll(root: AccessibilityNodeInfo, hasScrollTarget: Boolean): Boolean {
-        if (!hasScrollTarget) {
-            return false
+    private fun buildImmediateBrowserFallbackCapture(
+        root: AccessibilityNodeInfo,
+        currentUrl: String,
+        sessionBlocks: List<String> = emptyList()
+    ): BrowserOpenFallbackCapture? {
+        val contentRoot = findBestScrollableNode(root)
+        val visibleBlocks = try {
+            trimBrowserFallbackBlocks(
+                extractCapturedBlocks(contentRoot ?: root, visibleOnly = true)
+                    .distinctBy(::normalizeAccessibilityToken)
+            )
+        } finally {
+            contentRoot?.recycle()
         }
+        val visibleCapture = normalizeBrowserOpenFallbackCapture(
+            text = visibleBlocks.joinToString("\n\n").trim(),
+            title = visibleBlocks.firstOrNull()?.takeIf(::looksLikeCapturedTitle),
+            sourceLabel = currentUrl,
+            url = currentUrl
+        )
 
-        val packageName = root.packageName?.toString().orEmpty().lowercase(Locale.US)
-        return !packageName.contains("launcher") && !packageName.contains("systemui")
+        val sessionSnapshotBlocks = trimBrowserFallbackBlocks(
+            sessionBlocks
+                .filter { it.isNotBlank() }
+                .distinctBy(::normalizeAccessibilityToken)
+        )
+        val sessionCapture = buildBrowserFallbackCaptureFromBlocks(currentUrl, sessionSnapshotBlocks)
+
+        return choosePreferredBrowserOpenFallbackCapture(
+            visibleCapture = visibleCapture,
+            sessionCapture = sessionCapture
+        )
+    }
+
+    private fun buildBrowserFallbackCaptureFromBlocks(
+        currentUrl: String,
+        blocks: List<String>
+    ): BrowserOpenFallbackCapture? {
+        val trimmedBlocks = trimBrowserFallbackBlocks(
+            blocks
+                .filter { it.isNotBlank() }
+                .distinctBy(::normalizeAccessibilityToken)
+        )
+        return normalizeBrowserOpenFallbackCapture(
+            text = trimmedBlocks.joinToString("\n\n").trim(),
+            title = trimmedBlocks.firstOrNull()?.takeIf(::looksLikeCapturedTitle),
+            sourceLabel = currentUrl,
+            url = currentUrl
+        )?.takeIf(::isSubstantiveBrowserOpenFallbackCapture)
     }
 
     private fun findBrowserCurrentUrl(root: AccessibilityNodeInfo): String? {
@@ -461,6 +836,51 @@ class ReadAccessibilityService : AccessibilityService() {
         return chooseBestAccessibilityUrlCandidate(candidates)
     }
 
+    private fun findBrowserPageSignature(root: AccessibilityNodeInfo): String? {
+        var bestScore = Int.MIN_VALUE
+        var bestSignature: String? = null
+
+        fun visit(node: AccessibilityNodeInfo) {
+            if (!node.isVisibleToUser) {
+                return
+            }
+
+            val rawText = node.text?.toString()
+            val signature = normalizeBrowserPageSignature(rawText)
+            if (signature != null) {
+                val className = node.className?.toString()?.lowercase(Locale.US).orEmpty()
+                val isHeading = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && node.isHeading
+                var score = signature.length.coerceAtMost(80)
+                if (className.contains("webview")) {
+                    score += 160
+                }
+                if (isHeading) {
+                    score += 80
+                }
+                if (looksLikeCapturedTitle(rawText.orEmpty())) {
+                    score += 40
+                }
+                if (score > bestScore) {
+                    bestScore = score
+                    bestSignature = signature
+                }
+            }
+
+            for (index in 0 until node.childCount) {
+                node.getChild(index)?.let { child ->
+                    try {
+                        visit(child)
+                    } finally {
+                        child.recycle()
+                    }
+                }
+            }
+        }
+
+        visit(root)
+        return bestSignature
+    }
+
     private fun collectCandidateBlocks(
         node: AccessibilityNodeInfo,
         output: MutableList<AccessibilityTextBlock>,
@@ -470,15 +890,15 @@ class ReadAccessibilityService : AccessibilityService() {
             return
         }
 
-        val normalizedText = node.text?.toString()
-            ?.replace(Regex("\\s+"), " ")
-            ?.trim()
-            .orEmpty()
+        val textCandidate = resolveAccessibilityNodeTextCandidate(
+            rawText = node.text?.toString(),
+            rawContentDescription = node.contentDescription?.toString()
+        )
 
-        if (shouldIncludeNodeText(node, normalizedText)) {
+        if (textCandidate != null && shouldIncludeNodeText(node, textCandidate)) {
             val bounds = Rect().also(node::getBoundsInScreen)
             output += AccessibilityTextBlock(
-                text = normalizedText,
+                text = textCandidate.text,
                 top = bounds.top,
                 left = bounds.left,
                 bottom = bounds.bottom,
@@ -498,8 +918,11 @@ class ReadAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun shouldIncludeNodeText(node: AccessibilityNodeInfo, text: String): Boolean {
-        if (text.isBlank() || node.isPassword) {
+    private fun shouldIncludeNodeText(
+        node: AccessibilityNodeInfo,
+        candidate: AccessibilityNodeTextCandidate
+    ): Boolean {
+        if (candidate.text.isBlank() || node.isPassword) {
             return false
         }
 
@@ -508,7 +931,7 @@ class ReadAccessibilityService : AccessibilityService() {
             return false
         }
 
-        val normalized = text.replace(Regex("\\s+"), " ").trim()
+        val normalized = candidate.text.replace(Regex("\\s+"), " ").trim()
         val lower = normalized.lowercase(Locale.US)
         val wordCount = normalized.split(' ').count { it.isNotBlank() }
         val className = node.className?.toString()?.lowercase(Locale.US).orEmpty()
@@ -542,7 +965,7 @@ class ReadAccessibilityService : AccessibilityService() {
             return false
         }
 
-        if (hasReadableChild(node, normalized)) {
+        if (hasReadableChild(node, normalized, candidate.fromContentDescription)) {
             return false
         }
 
@@ -550,8 +973,16 @@ class ReadAccessibilityService : AccessibilityService() {
             return normalized.length >= 70 && wordCount >= 10
         }
 
-        if (node.isClickable && normalized.length < 36 && wordCount < 6 && !isHeading) {
-            return false
+        if (looksLikeInlineAccessibilityPunctuationToken(normalized)) {
+            return true
+        }
+
+        if (normalized.length < 36 && wordCount < 6 && !isHeading) {
+            return if (node.isClickable) {
+                looksLikeInlineLinkedAccessibilityText(normalized)
+            } else {
+                looksLikeInlineArticleAccessibilityText(normalized)
+            }
         }
 
         if (wordCount >= 8 || normalized.length >= 52) {
@@ -565,20 +996,28 @@ class ReadAccessibilityService : AccessibilityService() {
         return false
     }
 
-    private fun hasReadableChild(node: AccessibilityNodeInfo, nodeText: String): Boolean {
+    private fun hasReadableChild(
+        node: AccessibilityNodeInfo,
+        nodeText: String,
+        fromContentDescription: Boolean
+    ): Boolean {
+        if (fromContentDescription && node.isClickable) {
+            return false
+        }
+
         val normalizedNodeText = normalizeAccessibilityToken(nodeText)
         for (index in 0 until node.childCount) {
             val child = node.getChild(index) ?: continue
             try {
-                val childText = child.text?.toString()
-                    ?.replace(Regex("\\s+"), " ")
-                    ?.trim()
-                    .orEmpty()
-                if (childText.isBlank()) {
+                val childCandidate = resolveAccessibilityNodeTextCandidate(
+                    rawText = child.text?.toString(),
+                    rawContentDescription = child.contentDescription?.toString()
+                ) ?: continue
+                if (childCandidate.text.isBlank()) {
                     continue
                 }
 
-                val normalizedChildText = normalizeAccessibilityToken(childText)
+                val normalizedChildText = normalizeAccessibilityToken(childCandidate.text)
                 if (normalizedChildText.isBlank()) {
                     continue
                 }
@@ -601,6 +1040,47 @@ class ReadAccessibilityService : AccessibilityService() {
         mainHandler.post {
             Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
         }
+    }
+
+    private fun maybeTrackBrowserUrl(event: AccessibilityEvent?) {
+        val packageName = event?.packageName?.toString().orEmpty()
+        if (!looksLikeBrowserPackage(packageName)) {
+            return
+        }
+
+        val nowMs = SystemClock.elapsedRealtime()
+        if (nowMs - lastBrowserUrlTrackAttemptAtMs < BROWSER_URL_TRACK_THROTTLE_MS) {
+            return
+        }
+        lastBrowserUrlTrackAttemptAtMs = nowMs
+
+        val root = rootInActiveWindow ?: return
+        val pageSignature = findBrowserPageSignature(root)
+        findBrowserCurrentUrl(root)?.let { currentUrl ->
+            rememberTrackedBrowserUrl(packageName, currentUrl, pageSignature)
+        }
+    }
+
+    private fun rememberTrackedBrowserUrl(
+        packageName: String,
+        url: String,
+        pageSignature: String?
+    ) {
+        val normalizedPackageName = packageName.trim().lowercase(Locale.US)
+        if (!looksLikeBrowserPackage(normalizedPackageName) || !looksLikeBrowserOpenableUrl(url)) {
+            return
+        }
+        val normalizedPageSignature = pageSignature
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: return
+
+        lastTrackedBrowserUrl = TrackedBrowserUrl(
+            packageName = normalizedPackageName,
+            url = url,
+            capturedAtMs = SystemClock.elapsedRealtime(),
+            pageSignature = normalizedPageSignature
+        )
     }
 
     private fun registerAccessibilityButtonCallbackIfSupported() {
@@ -629,15 +1109,230 @@ class ReadAccessibilityService : AccessibilityService() {
     }
 }
 
+internal fun trimBrowserFallbackBlocks(blocks: List<String>): List<String> {
+    if (blocks.isEmpty()) {
+        return emptyList()
+    }
+
+    val startIndex = findBrowserFallbackStartIndex(blocks)
+    val afterStart = blocks.drop(startIndex)
+    val trailingBoundaryIndex = afterStart.indexOfFirst(::looksLikeBrowserFallbackBoundaryBlock)
+    val trimmed = if (trailingBoundaryIndex >= 0) {
+        afterStart.take(trailingBoundaryIndex)
+    } else {
+        afterStart
+    }
+
+    return trimmed.ifEmpty { blocks }
+}
+
+private fun findBrowserFallbackStartIndex(blocks: List<String>): Int {
+    val candidateLimit = minOf(blocks.lastIndex, 5)
+    var bestIndex = 0
+    var bestScore = Int.MIN_VALUE
+    for (index in 0..candidateLimit) {
+        val score = scoreBrowserFallbackTitleCandidate(blocks, index)
+        if (score > bestScore) {
+            bestScore = score
+            bestIndex = index
+        }
+    }
+
+    return if (bestScore >= 55) bestIndex else 0
+}
+
+private fun scoreBrowserFallbackTitleCandidate(blocks: List<String>, index: Int): Int {
+    val candidate = blocks.getOrNull(index)
+        ?.replace(Regex("\\s+"), " ")
+        ?.trim()
+        .orEmpty()
+    if (!looksLikeCapturedTitle(candidate)) {
+        return Int.MIN_VALUE
+    }
+
+    val normalizedCandidate = normalizeAccessibilityToken(candidate)
+    var score = 30 - (index * 4)
+    val lower = candidate.lowercase(Locale.US)
+    if (looksLikeBrowserChromeTitleText(lower)) {
+        score -= 18
+    }
+    if (lower.contains(" - by ")) {
+        score -= 14
+    }
+    if (blocks.take(index).any { previous ->
+            val normalizedPrevious = normalizeAccessibilityToken(previous)
+            normalizedPrevious.length > normalizedCandidate.length &&
+                normalizedPrevious.contains(normalizedCandidate)
+        }
+    ) {
+        score += 28
+    }
+
+    val next = blocks.getOrNull(index + 1).orEmpty()
+    val next2 = blocks.getOrNull(index + 2).orEmpty()
+    val next3 = blocks.getOrNull(index + 3).orEmpty()
+    if (looksLikeBrowserFallbackSubtitle(next)) {
+        score += 12
+    }
+    if (looksLikeBrowserFallbackMetadata(next) || looksLikeBrowserFallbackMetadata(next2)) {
+        score += 18
+    }
+    if (
+        looksLikeBrowserFallbackParagraph(next) ||
+        looksLikeBrowserFallbackParagraph(next2) ||
+        looksLikeBrowserFallbackParagraph(next3)
+    ) {
+        score += 14
+    }
+
+    return score
+}
+
+private fun looksLikeBrowserChromeTitleText(lower: String): Boolean {
+    return lower.contains(".com") ||
+        lower.contains("www.") ||
+        lower.contains("substack") ||
+        lower.contains("arg min") ||
+        lower.contains(" - by ")
+}
+
+private fun looksLikeBrowserFallbackSubtitle(text: String): Boolean {
+    val normalized = text.replace(Regex("\\s+"), " ").trim()
+    val wordCount = normalized.split(Regex("\\s+")).count { it.isNotBlank() }
+    return normalized.length in 20..160 &&
+        wordCount in 4..22 &&
+        !looksLikeBrowserFallbackMetadata(normalized) &&
+        !looksLikeBrowserFallbackParagraph(normalized)
+}
+
+private fun looksLikeBrowserFallbackMetadata(text: String): Boolean {
+    val normalized = text.replace(Regex("\\s+"), " ").trim()
+    if (normalized.isBlank()) {
+        return false
+    }
+
+    val lower = normalized.lowercase(Locale.US)
+    if (lower.startsWith("by ") || lower.startsWith("published ")) {
+        return true
+    }
+
+    return Regex(
+        """\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\b""",
+        RegexOption.IGNORE_CASE
+    ).containsMatchIn(normalized)
+}
+
+private fun looksLikeBrowserFallbackParagraph(text: String): Boolean {
+    val normalized = text.replace(Regex("\\s+"), " ").trim()
+    val wordCount = normalized.split(Regex("\\s+")).count { it.isNotBlank() }
+    return normalized.length >= 120 || wordCount >= 20
+}
+
+private fun looksLikeBrowserFallbackBoundaryBlock(text: String): Boolean {
+    val normalized = text.replace(Regex("\\s+"), " ").trim().lowercase(Locale.US)
+    if (normalized.isBlank()) {
+        return false
+    }
+
+    if (normalized.startsWith("comment by ") || normalized.startsWith("reply by ")) {
+        return true
+    }
+    if (Regex("""^\d+\s+repl(?:y|ies)\b""").containsMatchIn(normalized)) {
+        return true
+    }
+
+    val markers = listOf(
+        "discussion about this post",
+        "select discussion type",
+        "post preview for",
+        "start your substack",
+        "leave a comment",
+        "add a comment",
+        "see all comments"
+    )
+    return markers.any { marker -> normalized == marker || normalized.startsWith("$marker ") || normalized.contains(marker) }
+}
+
+private fun looksLikeInlineLinkedAccessibilityText(text: String): Boolean {
+    val normalized = text.replace(Regex("\\s+"), " ").trim()
+    if (normalized.length !in 3..72) {
+        return false
+    }
+
+    val lower = normalized.lowercase(Locale.US)
+    val blockedLabels = setOf(
+        "back", "share", "reply", "comment", "comments", "menu", "search", "home", "next",
+        "previous", "open", "close", "save", "follow", "subscribe", "like", "repost"
+    )
+    if (lower in blockedLabels) {
+        return false
+    }
+
+    val wordCount = normalized.split(Regex("\\s+")).count { it.isNotBlank() }
+    if (wordCount !in 1..6) {
+        return false
+    }
+
+    val letterCount = normalized.count(Char::isLetter)
+    if (letterCount < maxOf(3, normalized.length / 2)) {
+        return false
+    }
+
+    if (wordCount == 1) {
+        return normalized.length >= 3 && normalized.firstOrNull()?.isLetter() == true
+    }
+
+    return true
+}
+
+private fun looksLikeInlineArticleAccessibilityText(text: String): Boolean {
+    val normalized = text.replace(Regex("\\s+"), " ").trim()
+    if (normalized.length !in 4..72) {
+        return false
+    }
+
+    val lower = normalized.lowercase(Locale.US)
+    val blockedLabels = setOf(
+        "back", "share", "reply", "comment", "comments", "menu", "search", "home", "next",
+        "previous", "open", "close", "save", "follow", "subscribe", "like", "repost",
+        "related", "recommended", "more", "view all"
+    )
+    if (lower in blockedLabels) {
+        return false
+    }
+
+    val wordCount = normalized.split(Regex("\\s+")).count { it.isNotBlank() }
+    if (wordCount !in 1..6) {
+        return false
+    }
+
+    val letterCount = normalized.count(Char::isLetter)
+    if (letterCount < maxOf(4, normalized.length / 2)) {
+        return false
+    }
+
+    if (wordCount == 1) {
+        return normalized.length >= 4 &&
+            normalized.firstOrNull()?.isLetter() == true
+    }
+
+    val uppercaseInitials = normalized.split(Regex("\\s+"))
+        .count { token -> token.firstOrNull()?.isUpperCase() == true }
+    return uppercaseInitials >= 1 || normalized.contains(',')
+}
+
 private data class AccessibilityCaptureSession(
     val blocks: MutableList<String> = mutableListOf(),
     val seenTokens: MutableSet<String> = linkedSetOf(),
+    val sourceLabel: String? = null,
     var scrollStepCount: Int = 0,
     var stalledScrollCount: Int = 0
 )
 
 private data class WindowCaptureSummary(
     val newBlockCount: Int,
+    val combinedBlockCount: Int,
+    val combinedChars: Int,
     val alreadyExposedEnough: Boolean
 )
 
@@ -733,11 +1428,7 @@ internal fun mergeAccessibilityBlocks(blocks: List<AccessibilityTextBlock>): Lis
     val ordered = blocks
         .filterNot(::looksLikeNoisyAccessibilityBlock)
         .distinctBy { normalizeAccessibilityToken(it.text) }
-        .sortedWith(
-            compareBy<AccessibilityTextBlock> { it.top }
-                .thenBy { it.left }
-                .thenByDescending { it.bottom - it.top }
-        )
+        .sortedWith(::compareAccessibilityBlocksForReadingOrder)
 
     val merged = mutableListOf<AccessibilityTextBlock>()
     for (block in ordered) {
@@ -745,6 +1436,16 @@ internal fun mergeAccessibilityBlocks(blocks: List<AccessibilityTextBlock>): Lis
         if (previous != null && shouldMergeAccessibilityBlocks(previous, block)) {
             merged[merged.lastIndex] = previous.copy(
                 text = joinAccessibilityBlockText(previous.text, block.text),
+                bottom = maxOf(previous.bottom, block.bottom),
+                right = maxOf(previous.right, block.right),
+                isHeading = previous.isHeading && block.isHeading,
+                isClickable = previous.isClickable && block.isClickable
+            )
+        } else if (previous != null && shouldReverseMergeAccessibilityBlocks(previous, block)) {
+            merged[merged.lastIndex] = previous.copy(
+                text = joinAccessibilityBlockText(block.text, previous.text),
+                top = minOf(previous.top, block.top),
+                left = minOf(previous.left, block.left),
                 bottom = maxOf(previous.bottom, block.bottom),
                 right = maxOf(previous.right, block.right),
                 isHeading = previous.isHeading && block.isHeading,
@@ -760,6 +1461,69 @@ internal fun mergeAccessibilityBlocks(blocks: List<AccessibilityTextBlock>): Lis
         .filter { it.isNotBlank() }
 }
 
+private fun compareAccessibilityBlocksForReadingOrder(
+    first: AccessibilityTextBlock,
+    second: AccessibilityTextBlock
+): Int {
+    val sameVisualLine =
+        first.top <= second.bottom + 12 &&
+            first.bottom >= second.top - 12 &&
+            abs(first.top - second.top) <= 14
+    if (sameVisualLine) {
+        val firstContinuation = looksLikeAccessibilityLineContinuation(first)
+        val secondContinuation = looksLikeAccessibilityLineContinuation(second)
+        if (firstContinuation != secondContinuation) {
+            return if (firstContinuation) 1 else -1
+        }
+
+        if (abs(first.left - second.left) <= 16) {
+            val firstHeight = (first.bottom - first.top).coerceAtLeast(0)
+            val secondHeight = (second.bottom - second.top).coerceAtLeast(0)
+            val heightComparison = firstHeight.compareTo(secondHeight)
+            if (heightComparison != 0) {
+                return heightComparison
+            }
+        }
+
+        val leftComparison = first.left.compareTo(second.left)
+        if (leftComparison != 0) {
+            return leftComparison
+        }
+    }
+
+    val topComparison = first.top.compareTo(second.top)
+    if (topComparison != 0) {
+        return topComparison
+    }
+
+    val leftComparison = first.left.compareTo(second.left)
+    if (leftComparison != 0) {
+        return leftComparison
+    }
+
+    return (second.bottom - second.top).compareTo(first.bottom - first.top)
+}
+
+private fun looksLikeAccessibilityLineContinuation(block: AccessibilityTextBlock): Boolean {
+    val normalized = block.text.replace(Regex("\\s+"), " ").trimStart()
+    val firstChar = normalized.firstOrNull() ?: return false
+    if (firstChar in setOf(',', ';', ':', '.', ')', ']', '}')) {
+        return true
+    }
+
+    if (!firstChar.isLowerCase()) {
+        return false
+    }
+
+    val wordCount = normalized.split(Regex("\\s+")).count { it.isNotBlank() }
+    return normalized.length >= 40 || wordCount >= 7
+}
+
+private fun looksLikeInlineAccessibilityPunctuationToken(text: String): Boolean {
+    val normalized = text.replace(Regex("\\s+"), " ").trim()
+    return normalized.isNotEmpty() && normalized.all { it in ".,;:!?" }
+}
+
 internal fun shouldMergeAccessibilityBlocks(
     previous: AccessibilityTextBlock,
     next: AccessibilityTextBlock
@@ -772,12 +1536,38 @@ internal fun shouldMergeAccessibilityBlocks(
         return false
     }
 
+    val sameLineOverlap =
+        next.top <= previous.bottom + 12 &&
+            next.bottom >= previous.top - 12
+    val previousLooksLikeContainer =
+        (previous.right - previous.left).coerceAtLeast(0) >= 400 ||
+            (previous.bottom - previous.top).coerceAtLeast(0) >= 100
+    val sameLineInlineContinuation =
+        sameLineOverlap &&
+            (next.left - previous.right) in -8..160
+    val nestedInlineFragment =
+        sameLineOverlap &&
+            previousLooksLikeContainer &&
+            next.left >= previous.left - 12 &&
+            next.right <= previous.right + 12 &&
+            (
+                looksLikeInlineLinkedAccessibilityText(next.text) ||
+                    looksLikeInlineArticleAccessibilityText(next.text) ||
+                    looksLikeInlineAccessibilityPunctuationToken(next.text) ||
+                    looksLikeAccessibilityLineContinuation(next)
+            )
+    val fullWidthContinuation =
+        sameLineOverlap &&
+            previousLooksLikeContainer &&
+            looksLikeAccessibilityLineContinuation(next) &&
+            next.left <= previous.left + 24 &&
+            next.right >= previous.right - 24
     val verticalGap = next.top - previous.bottom
-    if (verticalGap !in -6..42) {
+    if (!sameLineInlineContinuation && !nestedInlineFragment && !fullWidthContinuation && verticalGap !in -6..42) {
         return false
     }
 
-    if (abs(previous.left - next.left) > 96) {
+    if (!sameLineInlineContinuation && !nestedInlineFragment && !fullWidthContinuation && abs(previous.left - next.left) > 96) {
         return false
     }
 
@@ -788,6 +1578,26 @@ internal fun shouldMergeAccessibilityBlocks(
     }
 
     return previous.text.length < 110 && nextStartsLowercase
+}
+
+private fun shouldReverseMergeAccessibilityBlocks(
+    previous: AccessibilityTextBlock,
+    next: AccessibilityTextBlock
+): Boolean {
+    if (previous.isHeading || next.isHeading) {
+        return false
+    }
+
+    val sameLineReverseContinuation =
+        next.top <= previous.bottom + 12 &&
+            next.bottom >= previous.top - 12 &&
+            (previous.left - next.right) in -8..48
+    if (!sameLineReverseContinuation) {
+        return false
+    }
+
+    return looksLikeInlineLinkedAccessibilityText(next.text) ||
+        looksLikeInlineLinkedAccessibilityText(previous.text)
 }
 
 internal fun joinAccessibilityBlockText(previous: String, next: String): String {
@@ -842,11 +1652,20 @@ internal fun looksLikeNoisyAccessibilityBlock(block: AccessibilityTextBlock): Bo
         return true
     }
 
-    if (block.isClickable && text.length < 36 && wordCount < 6) {
+    if (block.isClickable && text.length < 36 && wordCount < 6 && !looksLikeInlineLinkedAccessibilityText(text)) {
         return true
     }
 
-    if (text.length < 18 && wordCount < 3 && !block.isHeading) {
+    val looksLikeInlineArticleText =
+        (block.isClickable && looksLikeInlineLinkedAccessibilityText(text)) ||
+            (!block.isClickable && looksLikeInlineArticleAccessibilityText(text))
+    if (
+        text.length < 18 &&
+        wordCount < 3 &&
+        !block.isHeading &&
+        !looksLikeInlineArticleText &&
+        !looksLikeInlineAccessibilityPunctuationToken(text)
+    ) {
         return true
     }
 
@@ -932,6 +1751,18 @@ private fun shouldKeepAccessibilityBlock(
 
     if (inlineNoiseBetweenParagraphs) {
         return false
+    }
+
+    if (
+        current.isClickable &&
+        looksLikeInlineLinkedAccessibilityText(normalized) &&
+        previous != null &&
+        next != null &&
+        isSubstantialAccessibilityBlock(previous) &&
+        isSubstantialAccessibilityBlock(next) &&
+        leftDelta <= 72
+    ) {
+        return true
     }
 
     if (current.isClickable && normalized.length <= 60 && wordCount <= 10) {

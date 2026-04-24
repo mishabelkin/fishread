@@ -23,6 +23,24 @@ class ReaderDocumentLoaderHeuristicsTest {
     }
 
     @Test
+    fun looksLikeBrowserChallengeHtml_detectsDataDomeInterstitial() {
+        val html = """
+            <html lang="en">
+              <head><title>nytimes.com</title></head>
+              <body>
+                <p id="cmsg">Please enable JS and disable any ad blocker</p>
+                <script>
+                  var dd = { host: "geo.captcha-delivery.com" };
+                </script>
+                <script src="https://ct.captcha-delivery.com/c.js"></script>
+              </body>
+            </html>
+        """.trimIndent()
+
+        assertTrue(looksLikeBrowserChallengeHtmlForHeuristics(html))
+    }
+
+    @Test
     fun looksLikeNoisyWebContainer_preservesArticleWrapper_whenCommentEnabledContainsMainContent() {
         val parsed = Jsoup.parse(
             """

@@ -251,7 +251,16 @@ class MainActivity : ComponentActivity() {
                     if (uri.scheme.equals("content", ignoreCase = true) || uri.scheme.equals("file", ignoreCase = true)) {
                         viewModel.openUri(contentResolver, uri)
                     } else {
-                        viewModel.openUrl(uri.toString())
+                        val browserFallbackCapture = normalizeBrowserOpenFallbackCapture(
+                            text = intent.getStringExtra(ReaderAccessibilityIntents.EXTRA_URL_FALLBACK_CAPTURED_TEXT),
+                            title = intent.getStringExtra(ReaderAccessibilityIntents.EXTRA_URL_FALLBACK_CAPTURED_TITLE),
+                            sourceLabel = intent.getStringExtra(ReaderAccessibilityIntents.EXTRA_URL_FALLBACK_CAPTURED_SOURCE),
+                            url = uri.toString()
+                        )
+                        viewModel.openUrl(
+                            url = uri.toString(),
+                            browserFallbackCapture = browserFallbackCapture
+                        )
                     }
                 }
             }

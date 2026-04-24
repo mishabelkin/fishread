@@ -12,6 +12,9 @@ object ReaderAccessibilityIntents {
     const val EXTRA_CAPTURED_TEXT = "org.read.mobile.extra.CAPTURED_TEXT"
     const val EXTRA_CAPTURED_TITLE = "org.read.mobile.extra.CAPTURED_TITLE"
     const val EXTRA_CAPTURED_SOURCE = "org.read.mobile.extra.CAPTURED_SOURCE"
+    const val EXTRA_URL_FALLBACK_CAPTURED_TEXT = "org.read.mobile.extra.URL_FALLBACK_CAPTURED_TEXT"
+    const val EXTRA_URL_FALLBACK_CAPTURED_TITLE = "org.read.mobile.extra.URL_FALLBACK_CAPTURED_TITLE"
+    const val EXTRA_URL_FALLBACK_CAPTURED_SOURCE = "org.read.mobile.extra.URL_FALLBACK_CAPTURED_SOURCE"
 
     private const val CAPTURED_TEXT_SCHEME = "read-capture"
 
@@ -56,10 +59,19 @@ object ReaderAccessibilityIntents {
         }
     }
 
-    fun createOpenUrlIntent(context: Context, url: String): Intent {
+    fun createOpenUrlIntent(
+        context: Context,
+        url: String,
+        fallbackCapture: BrowserOpenFallbackCapture? = null
+    ): Intent {
         return Intent(context, MainActivity::class.java).apply {
             action = Intent.ACTION_VIEW
             data = Uri.parse(url)
+            fallbackCapture?.let {
+                putExtra(EXTRA_URL_FALLBACK_CAPTURED_TEXT, it.text)
+                putExtra(EXTRA_URL_FALLBACK_CAPTURED_TITLE, it.title)
+                putExtra(EXTRA_URL_FALLBACK_CAPTURED_SOURCE, it.sourceLabel)
+            }
             addFlags(
                 Intent.FLAG_ACTIVITY_NEW_TASK or
                     Intent.FLAG_ACTIVITY_CLEAR_TOP or

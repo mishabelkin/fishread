@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.content.ContentResolver
 import android.content.Context
 import android.net.Uri
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.OpenableColumns
@@ -1292,9 +1293,19 @@ internal fun looksLikeBrowserChallengeHtmlForHeuristics(html: String): Boolean {
         "i am human",
         "confirm you are human",
         "we need to check you're not a robot",
-        "x-hashcash-solution"
+        "x-hashcash-solution",
+        "please enable js and disable any ad blocker",
+        "captcha-delivery.com",
+        "geo.captcha-delivery.com"
     ).any { normalized.contains(it) }
 }
+
+internal class RemoteBrowserChallengeException(
+    urlString: String
+) : IllegalStateException(
+    "This site returned an anti-bot browser challenge. The desktop verifier cannot solve it through Robolectric WebView. " +
+        "Use Capture current page into verifier, paste raw HTML, or load saved HTML instead. URL: $urlString"
+)
 
 private data class PdfInput(
     val title: String,
@@ -1628,6 +1639,12 @@ class ReaderDocumentLoader(
                 }
 
                 if (responseCode !in 200..299) {
+                    if (!prefersPdf) {
+                        val errorHtml = readHttpResponseText(connection.errorStream)
+                        if (looksLikeBrowserChallengeHtml(errorHtml.orEmpty())) {
+                            return handleBrowserChallengeResponse(currentUrl)
+                        }
+                    }
                     if (!prefersPdf && shouldRetryHtmlFetch(responseCode)) {
                         return downloadHtmlDocumentWithJsoup(currentUrl)
                     }
@@ -1651,9 +1668,9 @@ class ReaderDocumentLoader(
                     )
                 }
 
-                val html = connection.inputStream.bufferedReader(StandardCharsets.UTF_8).use { it.readText() }
+                val html = readHttpResponseText(connection.inputStream).orEmpty()
                 if (looksLikeBrowserChallengeHtml(html)) {
-                    return downloadHtmlDocumentWithWebView(currentUrl)
+                    return handleBrowserChallengeResponse(currentUrl)
                 }
                 return RemoteDocument.WebPage(
                     title = resolvedTitle,
@@ -1687,7 +1704,7 @@ class ReaderDocumentLoader(
                 ?: resolveTitle(null, urlString)
             val html = document.outerHtml()
             if (looksLikeBrowserChallengeHtml(html)) {
-                return downloadHtmlDocumentWithWebView(urlString)
+                return handleBrowserChallengeResponse(urlString)
             }
 
             RemoteDocument.WebPage(
@@ -1855,6 +1872,25 @@ class ReaderDocumentLoader(
 
     private fun shouldRetryHtmlFetch(responseCode: Int): Boolean {
         return responseCode in listOf(401, 403, 406, 429)
+    }
+
+    private fun handleBrowserChallengeResponse(urlString: String): RemoteDocument.WebPage {
+        if (isRobolectricRuntime()) {
+            throw RemoteBrowserChallengeException(urlString)
+        }
+        return downloadHtmlDocumentWithWebView(urlString)
+    }
+
+    private fun isRobolectricRuntime(): Boolean {
+        val fingerprint = Build.FINGERPRINT.orEmpty().lowercase(Locale.US)
+        val model = Build.MODEL.orEmpty().lowercase(Locale.US)
+        return fingerprint.contains("robolectric") || model.contains("robolectric")
+    }
+
+    private fun readHttpResponseText(stream: java.io.InputStream?): String? {
+        return runCatching {
+            stream?.bufferedReader(StandardCharsets.UTF_8)?.use { it.readText() }
+        }.getOrNull()
     }
 
     private fun decodeJavascriptValue(value: String?): String? {

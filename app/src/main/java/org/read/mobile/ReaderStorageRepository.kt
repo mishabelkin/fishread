@@ -271,6 +271,14 @@ class ReaderStorageRepository(
         }
     }
 
+    fun loadPreferredCachedDocumentForRemoteOpen(sourceLabel: String): ReaderDocument? {
+        return withStorageLock {
+            loadCachedDocument(sourceLabel)
+                ?.takeIf(::shouldUseCachedDocument)
+                ?.takeIf(::isStrongRemoteWebCacheCandidate)
+        }
+    }
+
     fun saveDocumentCache(document: ReaderDocument) {
         withStorageLock {
             val json = JSONObject()
@@ -335,20 +343,28 @@ class ReaderStorageRepository(
             val json = JSONObject()
                 .put("blockIndex", blockIndex)
                 .put("scrollOffset", scrollOffset)
-            progressPrefs.edit().putString(progressKeyFor(sourceLabel), json.toString()).commit()
+            val serialized = json.toString()
+            val editor = progressPrefs.edit()
+            progressKeysFor(sourceLabel).forEach { key ->
+                editor.putString(key, serialized)
+            }
+            editor.commit()
         }
     }
 
     fun readingProgressFor(sourceLabel: String): ReadingProgress? {
         return withStorageLock {
-            val raw = progressPrefs.getString(progressKeyFor(sourceLabel), null) ?: return@withStorageLock null
-            runCatching {
-                val json = JSONObject(raw)
-                ReadingProgress(
-                    blockIndex = json.optInt("blockIndex", 0),
-                    scrollOffset = json.optInt("scrollOffset", 0)
-                )
-            }.getOrNull()
+            progressKeysFor(sourceLabel)
+                .firstNotNullOfOrNull { key ->
+                    val raw = progressPrefs.getString(key, null) ?: return@firstNotNullOfOrNull null
+                    runCatching {
+                        val json = JSONObject(raw)
+                        ReadingProgress(
+                            blockIndex = json.optInt("blockIndex", 0),
+                            scrollOffset = json.optInt("scrollOffset", 0)
+                        )
+                    }.getOrNull()
+                }
         }
     }
 
@@ -563,10 +579,27 @@ class ReaderStorageRepository(
     }
 
     private fun clearReadingProgress(sourceLabel: String) {
-        progressPrefs.edit().remove(progressKeyFor(sourceLabel)).commit()
+        val editor = progressPrefs.edit()
+        progressKeysFor(sourceLabel).forEach(editor::remove)
+        editor.commit()
     }
 
-    private fun progressKeyFor(sourceLabel: String) = "progress_${stableCacheKey(sourceLabel)}"
+    private fun progressKeysFor(sourceLabel: String): List<String> {
+        val aliases = linkedSetOf<String>()
+        aliases += progressKeyForIdentity(progressIdentityFor(sourceLabel))
+        aliases += progressKeyForIdentity(sourceLabel)
+        return aliases.toList()
+    }
+
+    private fun progressIdentityFor(sourceLabel: String): String {
+        return if (sourceLabel.startsWith("http://") || sourceLabel.startsWith("https://")) {
+            canonicalHistorySource(sourceLabel)
+        } else {
+            sourceLabel
+        }
+    }
+
+    private fun progressKeyForIdentity(identity: String) = "progress_${stableCacheKey(identity)}"
 
     private fun cacheFileFor(sourceLabel: String) =
         cacheDir.resolve("${stableCacheKey(sourceLabel)}.json")
@@ -933,6 +966,24 @@ class ReaderStorageRepository(
 
         val paragraphs = displayBlocks.count { it.type == ReaderBlockType.Paragraph }
         return paragraphs >= 3 && contentLength >= 800
+    }
+
+    private fun isStrongRemoteWebCacheCandidate(document: ReaderDocument): Boolean {
+        if (document.kind != DocumentKind.WEB) {
+            return true
+        }
+        if (!document.sourceLabel.startsWith("http://") && !document.sourceLabel.startsWith("https://")) {
+            return true
+        }
+
+        val displayBlocks = document.displayBlocks
+        val paragraphCount = displayBlocks.count { it.type == ReaderBlockType.Paragraph }
+        val headingCount = displayBlocks.count { it.type == ReaderBlockType.Heading }
+        val contentLength = displayBlocks
+            .filter { it.type == ReaderBlockType.Paragraph || it.type == ReaderBlockType.Heading }
+            .sumOf { it.text.length }
+
+        return paragraphCount >= 6 && contentLength >= 1800 && (paragraphCount + headingCount) >= 6
     }
 
     private fun resolveBookmarkSectionHeading(document: ReaderDocument?, blockIndex: Int): String? {

@@ -1,0 +1,8 @@
+text	top	left	bottom	right	isHeading	isClickable
+Sample Article Title	709	46	816	1035	true	false
+This is a sample article paragraph about large-scale systems. A reference link is 	1537	46	1756	1029	false	false
+here	1695	506	1756	598	false	false
+.	1695	595	1756	612	false	false
+Jordan Rivera, 	1830	46	1891	310	false	false
+a systems architecture researcher	1830	307	1891	891	false	false
+, has been a close collaborator for years and keeps returning to the need for clearer engineering abstractions across complex systems.	1830	46	2410	1026	false	false

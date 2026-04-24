@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.ContentResolver
 import android.net.Uri
 import android.text.format.Formatter
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
@@ -18,6 +19,7 @@ import kotlin.math.roundToInt
 
 private const val SUMMARY_PROGRESS_ESTIMATE_MS = 120_000L
 private const val SUMMARY_PREPARING_PHASE_MS = 2_500L
+private const val OPEN_URL_LOG_TAG = "ReadOpenUrl"
 
 class PdfReaderViewModel(application: Application) : AndroidViewModel(application) {
     private val app = application
@@ -357,7 +359,10 @@ class PdfReaderViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    fun openUrl(url: String) {
+    fun openUrl(
+        url: String,
+        browserFallbackCapture: BrowserOpenFallbackCapture? = null
+    ) {
         val normalized = url.trim()
         if (normalized.isBlank()) {
             val message = app.getString(R.string.error_paste_url_first)
@@ -385,7 +390,7 @@ class PdfReaderViewModel(application: Application) : AndroidViewModel(applicatio
         requestOpenReaderScreen()
         viewModelScope.launch {
             runCatching {
-                repository.loadUsableCachedDocumentForSource(normalized)?.let { cachedDocument ->
+                repository.loadPreferredCachedDocumentForRemoteOpen(normalized)?.let { cachedDocument ->
                     repository.rememberLastOpened(cachedDocument)
                     _uiState.update {
                         it.copy(
@@ -416,6 +421,37 @@ class PdfReaderViewModel(application: Application) : AndroidViewModel(applicatio
                 val document = withContext(Dispatchers.IO) {
                     documentLoader.loadFromUrl(normalized)
                 }
+                if (shouldPreferBrowserFallbackDocument(document, browserFallbackCapture)) {
+                    val fallbackCapture = requireNotNull(browserFallbackCapture)
+                    Log.w(
+                        OPEN_URL_LOG_TAG,
+                        "Remote open for $normalized returned a weak document; using browser snapshot fallback (${fallbackCapture.text.length} chars)"
+                    )
+                    val fallbackDocument = withContext(Dispatchers.Default) {
+                        documentLoader.loadFromPlainText(
+                            text = fallbackCapture.text,
+                            title = fallbackCapture.title,
+                            sourceLabel = fallbackCapture.sourceLabel
+                        )
+                    }
+                    withContext(Dispatchers.IO) {
+                        repository.saveDocumentCache(fallbackDocument)
+                    }
+                    repository.rememberLastOpened(fallbackDocument)
+                    _uiState.update {
+                        it.copy(
+                            urlInput = normalized,
+                            isLoading = false,
+                            loadingMessage = "",
+                            document = fallbackDocument,
+                            errorMessage = null,
+                            snackbarMessage = app.getString(R.string.message_opened_browser_snapshot_fallback),
+                            history = repository.saveHistoryForDocument(fallbackDocument)
+                        )
+                    }
+                    maybeStartBackgroundCleanup(fallbackDocument)
+                    return@runCatching
+                }
                 withContext(Dispatchers.IO) {
                     repository.saveDocumentCache(document)
                 }
@@ -433,13 +469,65 @@ class PdfReaderViewModel(application: Application) : AndroidViewModel(applicatio
                 }
                 maybeStartBackgroundCleanup(document)
             }.onFailure { error ->
-                _uiState.update {
-                    it.copy(
-                        isLoading = false,
-                        loadingMessage = "",
-                        errorMessage = error.message ?: app.getString(R.string.error_unable_to_open_url),
-                        snackbarMessage = error.message ?: app.getString(R.string.error_unable_to_open_url)
+                val fallbackCapture = browserFallbackCapture
+                if (fallbackCapture != null) {
+                    Log.w(
+                        OPEN_URL_LOG_TAG,
+                        "Remote open failed for $normalized; using browser snapshot fallback (${fallbackCapture.text.length} chars)",
+                        error
                     )
+                    runCatching {
+                        val fallbackDocument = withContext(Dispatchers.Default) {
+                            documentLoader.loadFromPlainText(
+                                text = fallbackCapture.text,
+                                title = fallbackCapture.title,
+                                sourceLabel = fallbackCapture.sourceLabel
+                            )
+                        }
+                        withContext(Dispatchers.IO) {
+                            repository.saveDocumentCache(fallbackDocument)
+                        }
+                        repository.rememberLastOpened(fallbackDocument)
+
+                        _uiState.update {
+                            it.copy(
+                                urlInput = normalized,
+                                isLoading = false,
+                                loadingMessage = "",
+                                document = fallbackDocument,
+                                errorMessage = null,
+                                snackbarMessage = app.getString(R.string.message_opened_browser_snapshot_fallback),
+                                history = repository.saveHistoryForDocument(fallbackDocument)
+                            )
+                        }
+                        maybeStartBackgroundCleanup(fallbackDocument)
+                    }.onFailure { fallbackError ->
+                        Log.e(
+                            OPEN_URL_LOG_TAG,
+                            "Browser snapshot fallback also failed for $normalized",
+                            fallbackError
+                        )
+                        _uiState.update {
+                            it.copy(
+                                isLoading = false,
+                                loadingMessage = "",
+                                errorMessage = fallbackError.message ?: error.message
+                                ?: app.getString(R.string.error_unable_to_open_url),
+                                snackbarMessage = fallbackError.message ?: error.message
+                                ?: app.getString(R.string.error_unable_to_open_url)
+                            )
+                        }
+                    }
+                } else {
+                    Log.e(OPEN_URL_LOG_TAG, "Remote open failed for $normalized with no browser fallback", error)
+                    _uiState.update {
+                        it.copy(
+                            isLoading = false,
+                            loadingMessage = "",
+                            errorMessage = error.message ?: app.getString(R.string.error_unable_to_open_url),
+                            snackbarMessage = error.message ?: app.getString(R.string.error_unable_to_open_url)
+                        )
+                    }
                 }
             }
         }

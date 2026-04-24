@@ -34,7 +34,19 @@ def ui_html(port: int) -> str:
         "setTimeout(()=>form.remove(),1000);"
         "}catch(error){alert(error&&error.message?error.message:String(error));}})();"
     )
+    clipboard_bookmarklet = (
+        "javascript:(async()=>{try{"
+        "const payload='READ_VERIFIER_CAPTURE_V1\\n'+JSON.stringify({sourceLabel:location.href,rawHtml:document.documentElement.outerHTML});"
+        "const copyWithExecCommand=(text)=>{const box=document.createElement('textarea');box.value=text;box.setAttribute('readonly','readonly');box.style.position='fixed';box.style.top='0';box.style.left='0';box.style.width='1px';box.style.height='1px';box.style.opacity='0';document.body.appendChild(box);box.focus();box.select();const ok=document.execCommand('copy');box.remove();return ok;};"
+        "let copied=false;"
+        "if(navigator.clipboard&&window.isSecureContext){try{await navigator.clipboard.writeText(payload);copied=true;}catch(error){}}"
+        "if(!copied){copied=copyWithExecCommand(payload);}"
+        "if(!copied){throw new Error('Could not copy the captured page payload.');}"
+        "alert('Captured page copied. Go back to the verifier and use Paste captured page.');"
+        "}catch(error){alert(error&&error.message?error.message:String(error));}})();"
+    )
     bookmarklet_href = html.escape(bookmarklet, quote=True)
+    clipboard_bookmarklet_href = html.escape(clipboard_bookmarklet, quote=True)
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -106,11 +118,17 @@ def ui_html(port: int) -> str:
       </div>
 
       <div style="margin-top:14px;">
+        <label for="capturePayloadInput">Captured page payload paste (optional)</label>
+        <textarea id="capturePayloadInput" placeholder="Paste payload copied by the bookmarklet here, or use Paste captured page."></textarea>
+      </div>
+
+      <div style="margin-top:14px;">
         <label for="rawHtmlInput">Raw HTML paste</label>
         <textarea id="rawHtmlInput" placeholder="Paste page HTML here if you want to inspect a saved DOM snapshot directly."></textarea>
       </div>
 
       <div class="actions">
+        <button id="pasteCaptureButton" type="button">Paste captured page</button>
         <button id="runButton" type="button">Run verifier</button>
         <span id="status" class="status">Idle</span>
       </div>
@@ -122,29 +140,59 @@ def ui_html(port: int) -> str:
         <li>For saved HTML, the optional source label matters because some heuristics depend on host or URL shape.</li>
         <li>For raw HTML paste, give the source label if the page came from a specific URL.</li>
         <li>PDF and HTML file inputs are read in the browser and posted to the local verifier service on this machine only.</li>
-        <li>For challenge-gated pages like WSJ, open the article in your browser first and use the capture bookmarklet below.</li>
+        <li>For challenge-gated pages like WSJ or NYT, open the article in your browser first and use the copy capture bookmarklet below.</li>
       </ul>
     </div>
 
     <div class="card">
       <h2 style="margin-top:0;">Capture current browser page</h2>
-      <p class="muted">For pages that only work once your browser has solved the challenge or loaded the live DOM, drag this link to your bookmarks bar, open the article, and click it.</p>
+      <p class="muted">For pages that only work once your browser has solved the challenge or loaded the live DOM, drag one or both links to your bookmarks bar.</p>
+      <p><a href="{clipboard_bookmarklet_href}">Copy current page for verifier</a></p>
+      <p class="muted">Recommended for strict pages like NYT. It copies the current DOM and source URL to your clipboard without posting directly from the site.</p>
       <p><a href="{bookmarklet_href}">Capture current page into verifier</a></p>
-      <p class="muted">The bookmarklet sends the current page HTML to your local verifier server and replaces the tab with the generated report.</p>
+      <p class="muted">Faster direct path. Some sites block it by upgrading or blocking local HTTP posts from the page.</p>
     </div>
   </main>
 
   <script>
+    const CAPTURE_PREFIX = 'READ_VERIFIER_CAPTURE_V1\\n';
+    const pasteCaptureButton = document.getElementById('pasteCaptureButton');
     const runButton = document.getElementById('runButton');
     const statusEl = document.getElementById('status');
     const urlInput = document.getElementById('urlInput');
     const sourceLabelInput = document.getElementById('sourceLabelInput');
     const htmlFileInput = document.getElementById('htmlFileInput');
     const pdfFileInput = document.getElementById('pdfFileInput');
+    const capturePayloadInput = document.getElementById('capturePayloadInput');
     const rawHtmlInput = document.getElementById('rawHtmlInput');
 
     function setStatus(message) {{
       statusEl.textContent = message;
+    }}
+
+    function parseCapturedPayload(text) {{
+      const trimmed = String(text || '').trim();
+      if (!trimmed) {{
+        return null;
+      }}
+
+      const jsonText = trimmed.startsWith(CAPTURE_PREFIX)
+        ? trimmed.slice(CAPTURE_PREFIX.length)
+        : trimmed;
+
+      try {{
+        const parsed = JSON.parse(jsonText);
+        if (parsed && typeof parsed.rawHtml === 'string') {{
+          return {{
+            sourceLabel: String(parsed.sourceLabel || '').trim(),
+            rawHtml: parsed.rawHtml
+          }};
+        }}
+      }} catch (error) {{
+        return null;
+      }}
+
+      return null;
     }}
 
     function readTextFile(file) {{
@@ -173,8 +221,10 @@ def ui_html(port: int) -> str:
       const url = urlInput.value.trim();
       const sourceLabel = sourceLabelInput.value.trim();
       const rawHtml = rawHtmlInput.value;
+      const capturePayload = capturePayloadInput.value;
       const htmlFile = htmlFileInput.files[0];
       const pdfFile = pdfFileInput.files[0];
+      const parsedCapture = parseCapturedPayload(capturePayload) || parseCapturedPayload(rawHtml);
 
       const payload = {{
         url,
@@ -188,10 +238,32 @@ def ui_html(port: int) -> str:
         payload.pdfBase64 = await readBase64(pdfFile);
       }} else if (htmlFile) {{
         payload.rawHtml = await readTextFile(htmlFile);
+      }} else if (parsedCapture) {{
+        payload.url = '';
+        payload.sourceLabel = sourceLabel || parsedCapture.sourceLabel || url;
+        payload.rawHtml = parsedCapture.rawHtml;
       }}
 
       return payload;
     }}
+
+    pasteCaptureButton.addEventListener('click', async () => {{
+      if (!navigator.clipboard || !window.isSecureContext) {{
+        setStatus('Clipboard read is not available here. Paste the copied payload into Captured page payload paste.');
+        return;
+      }}
+
+      try {{
+        const text = await navigator.clipboard.readText();
+        if (!parseCapturedPayload(text)) {{
+          throw new Error('Clipboard does not contain a verifier capture payload.');
+        }}
+        capturePayloadInput.value = text;
+        setStatus('Captured page payload pasted.');
+      }} catch (error) {{
+        setStatus(error && error.message ? error.message : 'Could not read the clipboard.');
+      }}
+    }});
 
     runButton.addEventListener('click', async () => {{
       runButton.disabled = true;

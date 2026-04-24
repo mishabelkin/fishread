@@ -243,8 +243,33 @@ class WebExtractionToolTest {
     }
 
     private fun renderFailureReport(sourceLabel: String, error: Throwable): String {
+        val browserChallengeFailure = generateSequence(error) { it.cause }
+            .any { it is RemoteBrowserChallengeException }
         val stack = error.stackTraceToString()
         val summary = error.message?.ifBlank { null } ?: error::class.java.simpleName
+        val failureTitle = if (browserChallengeFailure) {
+            "Browser challenge blocked desktop verifier"
+        } else {
+            "Remote load failed"
+        }
+        val failureHint = if (browserChallengeFailure) {
+            "This site returned an anti-bot or JS challenge. The Android phone path may still work, but the desktop verifier cannot solve this through Robolectric WebView."
+        } else {
+            "The verifier stayed up and wrote this report, but the remote page could not be opened through the Android-style loader path. This is common with paywalls, login-gated pages, challenge pages, or sites that rely on behaviors Robolectric WebView does not reproduce well."
+        }
+        val recommendedSteps = if (browserChallengeFailure) {
+            listOf(
+                "Open the page in your normal browser and use Capture current page into verifier.",
+                "Save the fully loaded page as HTML and load that file into the verifier.",
+                "Paste the browser DOM HTML into the verifier with the original page URL as the source label."
+            )
+        } else {
+            listOf(
+                "Use the verifier form to load a saved HTML file for this page.",
+                "Paste raw HTML from the browser into the verifier.",
+                "If the phone app opens the page but the verifier cannot, compare this error against the phone path rather than treating it as an extractor failure."
+            )
+        }
         return """
             <!DOCTYPE html>
             <html lang="en">
@@ -266,17 +291,15 @@ class WebExtractionToolTest {
                 <h1>Read! Extraction Verifier</h1>
                 <p><a href="/" onclick="if (window.history.length > 1) { window.history.back(); return false; }">&larr; Back to verifier form</a></p>
                 <div class="card">
-                  <h2 class="danger">Remote load failed</h2>
+                  <h2 class="danger">$failureTitle</h2>
                   <p><strong>Source:</strong> ${escapeHtml(sourceLabel)}</p>
                   <p><strong>Error:</strong> ${escapeHtml(summary)}</p>
-                  <p class="muted">The verifier stayed up and wrote this report, but the remote page could not be opened through the Android-style loader path. This is common with paywalls, login-gated pages, challenge pages, or sites that rely on behaviors Robolectric WebView does not reproduce well.</p>
+                  <p class="muted">${escapeHtml(failureHint)}</p>
                 </div>
                 <div class="card">
                   <h2>Recommended next steps</h2>
                   <ul>
-                    <li>Use the verifier form to load a saved HTML file for this page.</li>
-                    <li>Paste raw HTML from the browser into the verifier.</li>
-                    <li>If the phone app opens the page but the verifier cannot, compare this error against the phone path rather than treating it as an extractor failure.</li>
+                    ${recommendedSteps.joinToString("\n") { "<li>${escapeHtml(it)}</li>" }}
                   </ul>
                 </div>
                 <div class="card">
